@@ -1,0 +1,6 @@
+fastapi[standard]
+pydantic
+uvicorn
+sqlmodel
+pymysql
+mysqlclient
