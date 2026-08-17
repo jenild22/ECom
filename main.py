@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel
-from sqlmodel import Session, select
+from sqlmodel import Session, select, or_
 from models import User, Product, Order
 from db import create_user, update_user_db, create_product, engine
+from email_utils import send_email
 
 app = FastAPI()
 
@@ -17,9 +18,7 @@ class OrderCreateRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "Hello World"}
-
-
+    return {"message": "E-Commerce API is running!"}
 
 @app.post("/register")
 async def register(user: User):
@@ -66,11 +65,21 @@ async def delete_user(user_id: int):
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
+        user_orders = db.exec(
+            select(Order).where(or_(Order.buyer_id == user_id, Order.seller_id == user_id))
+        ).all()
+        for order in user_orders:
+            db.delete(order)
+
+        user_products = db.exec(
+            select(Product).where(Product.seller_id == user_id)
+        ).all()
+        for product in user_products:
+            db.delete(product)
+
         db.delete(user)
         db.commit()
-        return {"message": f"User {user_id} deleted successfully"}
-
-
+        return {"message": f"User {user_id} and all associated records deleted successfully"}
 
 @app.post("/products")
 async def add_product(product: Product):
@@ -116,11 +125,13 @@ async def delete_product(product_id: int):
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
         
+        product_orders = db.exec(select(Order).where(Order.product_id == product_id)).all()
+        for order in product_orders:
+            db.delete(order)
+
         db.delete(product)
         db.commit()
         return {"message": f"Product {product_id} deleted successfully"}
-
-
 
 @app.get("/products")
 async def get_all_products():
@@ -137,7 +148,7 @@ async def get_product_details(product_id: int):
         return product
 
 @app.post("/orders")
-async def purchase_product(order_req: OrderCreateRequest):
+async def purchase_product(order_req: OrderCreateRequest, background_tasks: BackgroundTasks):
     if order_req.quantity <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -155,6 +166,8 @@ async def purchase_product(order_req: OrderCreateRequest):
         product = db.get(Product, order_req.product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
+
+        seller = db.get(User, product.seller_id)
 
         if product.quantity < order_req.quantity:
             raise HTTPException(
@@ -180,6 +193,37 @@ async def purchase_product(order_req: OrderCreateRequest):
         db.add(product)
         db.commit()
         db.refresh(new_order)
+
+        buyer_subject = f"Order Confirmation - Order #{new_order.id}"
+        buyer_body = f"""Hi {buyer.username},
+
+Your order was placed successfully!
+
+Order Details:
+- Order ID: {new_order.id}
+- Product: {product.name}
+- Quantity: {new_order.quantity}
+- Total Amount: ${new_order.total_amount:.2f}
+- Status: {new_order.order_status}
+
+Thank you for shopping with us!"""
+
+        seller_subject = f"New Order Received - Order #{new_order.id}"
+        seller_body = f"""Hi {seller.username if seller else 'Seller'},
+
+You received a new order!
+
+Order Details:
+- Order ID: {new_order.id}
+- Buyer: {buyer.username} ({buyer.email})
+- Product: {product.name}
+- Quantity: {new_order.quantity}
+- Total Earnings: ${new_order.total_amount:.2f}"""
+
+        if buyer.email:
+            background_tasks.add_task(send_email, buyer.email, buyer_subject, buyer_body)
+        if seller and seller.email:
+            background_tasks.add_task(send_email, seller.email, seller_subject, seller_body)
 
         return {"message": "Order placed successfully", "order": new_order}
 
